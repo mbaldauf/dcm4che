@@ -81,16 +81,21 @@ import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.Arrays;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * @author Gunter Zeilinger <gunterze@gmail.com>
  */
 public class SpecificCharacterSet {
-    
+
+    private static final Logger LOG = LoggerFactory.getLogger(SpecificCharacterSet.class);
+
     public static final SpecificCharacterSet DICOM_DEFAULT =
             new SpecificCharacterSet(new Codec[] {Codec.ISO_646}, new String[] {null});
-    
+
     public static SpecificCharacterSet DEFAULT = DICOM_DEFAULT;
-    
+
     protected final Codec[] codecs;
     protected final String[] dicomCodes;
 
@@ -119,16 +124,20 @@ public class SpecificCharacterSet {
         private final byte[] escSeq0;
         private final byte[] escSeq1;
         private final int bytesPerChar;
+        private final byte[] replValBytes;
+        private final String replValString;
 
         private Codec(final String charsetName, final byte[] escSeq0, final byte[] escSeq1, final int bytesPerChar) {
             this.charsetName = charsetName;
             this.escSeq0 = escSeq0;
             this.escSeq1 = escSeq1;
             this.bytesPerChar = bytesPerChar;
+            this.replValBytes = Charset.forName(charsetName).newEncoder().replacement();
+            this.replValString = Charset.forName(charsetName).newDecoder().replacement();
         }
 
         public static Codec forCode(final String code) {
-            if (code == null) {
+            if (code == null || code.isEmpty()) {
                 return ISO_646;
             }
 
@@ -229,6 +238,8 @@ public class SpecificCharacterSet {
                     }
                     break;
             }
+
+            LOG.warn("Unsupported character set {} - will continue with default character repertoire", code);
             return ISO_646;
         }
 
@@ -262,20 +273,36 @@ public class SpecificCharacterSet {
             return encode(Character.toString(c));
         }
 
-        public String decode(final byte[] b) {
+        public String decode(final byte[] b, final StringValueType type) {
             try {
-                return new String(b, charsetName);
+                String decoded = new String(b, charsetName);
+                // handle two special cases regarding ISO-IR 14
+                if (this == Codec.JIS_X_201) {
+                    if (type == StringValueType.TEXT) {
+                        decoded = decoded.replace("\\", "¥"); // replace backslash with Yen sign
+                    }
+                    decoded = decoded.replace("~", "‾"); // replace tilde with over-line
+                }
+                return decoded;
             } catch (final UnsupportedEncodingException e) {
                 throw new AssertionError(e);
             }
         }
 
         public boolean containsASCII() {
-            return hasEscSeq0();
+            return Arrays.equals(escSeq0, ISO_646.getEscSeq0()) || Arrays.equals(escSeq0, JIS_X_201.escSeq0);
         }
 
         public int getBytesPerChar() {
             return bytesPerChar;
+        }
+
+        public byte[] getReplacementValueBytes() {
+            return replValBytes;
+        }
+
+        public String getReplacementValueString() {
+            return replValString;
         }
 
         public byte[] getEscSeq0() {
@@ -312,6 +339,7 @@ public class SpecificCharacterSet {
             }
             return true;
         }
+
     }
 
     private static final class ISO2022 extends SpecificCharacterSet {
@@ -332,10 +360,12 @@ public class SpecificCharacterSet {
 
             /*
              * Calculate maximum capacity of the ByteBuffer:
-             * In the worst case, each character has a preceding escape sequence of four bytes and the
-             * character itself takes up two bytes.
+             * In the worst case, each character has one preceding escape sequence of four bytes, the character
+             * itself takes up two bytes, every third character has a second preceding escape sequence (possible
+             * due to explicit G1 switching before control characters and delimiters), and two escape sequences
+             * of three bytes each at the end of the string value.
              */
-            final int maxCapacity = 4 * (val.length() * 2);
+            final int maxCapacity = 4 * (val.length() * 2) + 4 * (val.length() / 3) + 6;
             final ByteBuffer bb = ByteBuffer.allocate(maxCapacity);
 
             // try to encode each character of the string value consecutively
@@ -349,10 +379,10 @@ public class SpecificCharacterSet {
                 boolean delimiterPresent = false;
 
                 /*
-                 * Check 1: if first byte codes for a DICOM control character and therefore the initial
-                 * character set shall be active
+                 * Check 1: if first byte codes for a DICOM control character (TAB, LF, FF, CR) and therefore
+                 * the initial character set shall be active
                  */
-                if (firstByte >= 0x09 && firstByte <= 0x0D) {
+                if (firstByte == 0x09 || firstByte == 0x0A || firstByte == 0x0C || firstByte == 0x0D) {
                     delimiterPresent = true;
                 }
 
@@ -368,14 +398,21 @@ public class SpecificCharacterSet {
                  * Check 3: if data element may have multiple values and therefore the initial character set
                  * shall be active if the first byte codes for backslash character
                  */
-                if (type.multipleValues && firstByte == 0x5C && (codecG0 != Codec.JIS_X_201 || codecG0 == getInitialCodecG0())) {
+                if (type.multipleValues && firstByte == 0x5C) {
                     delimiterPresent = true;
                 }
 
-                // always encode delimiters with the initial character set
                 if (delimiterPresent) {
+                    /*
+                     * Always encode delimiters with the initial character set. It may not be required to switch back
+                     * G1. However, it is no violation of the DICOM standard to do so and also enables decoders that
+                     * always require explicit switching to the initial character set proper decoding.
+                     */
                     if (codecG0 != getInitialCodecG0()) {
                         bb.put(getInitialCodecG0().getEscSeq0());
+                    }
+                    if (codecG1 != getInitialCodecG1() && getInitialCodecG1() != null) {
+                        bb.put(getInitialCodecG1().getEscSeq1());
                     }
                     codecG0 = getInitialCodecG0();
                     codecG1 = getInitialCodecG1();
@@ -385,7 +422,7 @@ public class SpecificCharacterSet {
 
                 if (codecG0.canEncode(c)) {
                     final byte[] encodedChar = codecG0.encode(c);
-                    if (!(encodedChar[0] < 0)) {
+                    if (encodedChar[0] >= 0) {
                         bb.put(encodedChar);
                         continue;
                     }
@@ -403,7 +440,7 @@ public class SpecificCharacterSet {
                 for (final Codec cd : codecs) {
                     if (cd.canEncode(c)) {
                         final byte[] encodedChar = cd.encode(c);
-                        if (cd.hasEscSeq0() && !(encodedChar[0] < 0)) {
+                        if (cd.hasEscSeq0() && (encodedChar[0] >= 0)) {
                             codecG0 = cd;
                             bb.put(codecG0.getEscSeq0());
                             bb.put(encodedChar);
@@ -422,18 +459,30 @@ public class SpecificCharacterSet {
 
                 /*
                  * Could not encode character with any of the Specific Character Sets.
-                 * Switch to the initial codec G0 and append the unknown character as four characters "\nnn",
-                 * where "nnn" is the three digit octal representation of the character (see DICOM PS3.5 2016c,
-                 * 6.1.2.3 Encoding of Character Repertoires).
+                 * Switch to the initial codec G0 and append the unknown character using the corresponding
+                 * replacement value.
                  */
                 if (!couldEncode) {
+                    LOG.warn("Could not encode character {} with any of the given character sets - will continue by "
+                            + "using the replacement value", c);
                     if (codecG0 != getInitialCodecG0()) {
                         codecG0 = getInitialCodecG0();
                         bb.put(codecG0.getEscSeq0());
                     }
-                    bb.put(codecG0.encode('\\'));
-                    bb.put(codecG0.encode(Integer.toString(bb.get() & 0xFF, 8)));
+                    bb.put(codecG0.getReplacementValueBytes());
                 }
+            }
+
+            /*
+             * Switch back to the initial character set at the end of the Data Element value if necessary. It may not
+             * be required to switch back G1. However, it is no violation of the DICOM standard to do so and also
+             * enables decoders that always require explicit switching to the initial character set proper decoding.
+             */
+            if (codecG0 != getInitialCodecG0()) {
+                bb.put(getInitialCodecG0().getEscSeq0());
+            }
+            if (codecG1 != getInitialCodecG1() && getInitialCodecG1() != null) {
+                bb.put(getInitialCodecG1().getEscSeq1());
             }
 
             final byte[] encodedString = new byte[bb.position()];
@@ -454,7 +503,13 @@ public class SpecificCharacterSet {
                 // check if current byte initiates an escape sequence
                 if (bb.get(bb.position()) == 0x1b) { // ESC
                     boolean switched = false;
-                    for (final Codec c : codecs) {
+
+                    /*
+                     * Try to switch codec according to escape sequence by using an permissive approach incorporating
+                     * all supported character sets. Therefore, decoding is not restricted to the character sets
+                     * specified in Specific Character Set.
+                     */
+                    for (final Codec c : Codec.values()) {
                         if (c.hasEscSeq0() && c.containsEscSeq0(bb)) {
                             switched = true;
                             codecG0 = c;
@@ -466,17 +521,24 @@ public class SpecificCharacterSet {
                             break;
                         }
                     }
+
+                    // check if no switch occurred and therefore the present escape sequence is invalid
                     if (!switched) {
                         /*
                          * Unknown/invalid escape sequence detected.
-                         * Append all remaining bytes with the four characters "\nnn", where "nnn" is the
-                         * three digit octal representation of each byte (see DICOM PS3.5 2016c, 6.1.2.3
-                         * Encoding of Character Repertoires).
+                         * Append all remaining bytes using the replacement value of the initial character set. This
+                         * approach deviates from the recommended approach in DICOM PS3.5 2016c, 6.1.2.3 (Encoding of
+                         * Character Repertoires) because inclusion of backslash may lead to a Data Element with
+                         * multiple values (dcm4che3 interprets the backslash as delimiter between values in multiple
+                         * valued Data Elements) and therefore the risk of incompletely displayed strings to the user.
                          */
-                        while (bb.hasRemaining()) {
-                            sb.append("\\");
-                            sb.append(Integer.toString(bb.get() & 0xFF, 8));
+                        LOG.warn("Unknown or invalid escape sequence detected - will continue by using the "
+                                + "replacement character for all remaining bytes");
+                        int n = bb.limit() - bb.position();
+                        while (n-- > 0) {
+                            sb.append(getInitialCodecG0().replValString);
                         }
+                        break;
                     }
                 } else {
                     /*
@@ -488,10 +550,10 @@ public class SpecificCharacterSet {
                         final byte firstByte = bb.get(bb.position());
 
                         /*
-                         * Check 1: if first byte codes for a DICOM control character and therefore the initial
-                         * character set shall be active
+                         * Check 1: if first byte codes for a DICOM control character (TAB, LF, FF, CR) and therefore
+                         * the initial character set shall be active
                          */
-                        if (firstByte >= 0x09 && firstByte <= 0x0D) {
+                        if (firstByte == 0x09 || firstByte == 0x0A || firstByte == 0x0C || firstByte == 0x0D) {
                             codecG0 = getInitialCodecG0();
                             codecG1 = getInitialCodecG1();
                         }
@@ -509,25 +571,27 @@ public class SpecificCharacterSet {
                          * Check 3: if data element may have multiple values and therefore the initial character set
                          * shall be active if the first byte codes for backslash character
                          */
-                        if (type.multipleValues && firstByte == 0x5C &&
-                                (codecG0 != Codec.JIS_X_201 || codecG0 == getInitialCodecG0())) {
+                        if (type.multipleValues && firstByte == 0x5C) {
                             codecG0 = getInitialCodecG0();
                             codecG1 = getInitialCodecG1();
                         }
                     }
 
-                    // decode the current character
+                    // determine applicable codec
                     final Codec applicableCodec = bb.get(bb.position()) < 0 ? codecG1 : codecG0;
+
+                    // check if no applicable coded was found (e.g. character in G1 but G1 is undefined)
+                    if (applicableCodec == null) {
+                        LOG.warn("Invalid character 0x{} detected as no applicable codec was found - will continue by using "
+                                + "the replacement value", String.format("%02x", bb.get()));
+                        sb.append(getInitialCodecG0().getReplacementValueString());
+                        continue;
+                    }
+
+                    // decode the current character with the applicable codec
                     final byte[] currentChar = new byte[applicableCodec.getBytesPerChar()];
                     bb.get(currentChar);
-                    String s = applicableCodec.decode(currentChar);
-
-                    if (applicableCodec == Codec.JIS_X_201 && applicableCodec != getInitialCodecG0()) {
-                        // replace backslash character with Yen symbol
-                        s = s.replace("\\", "\u00A5");
-                        // replace tilde character with over-line
-                        s = s.replace("~", "\u203E");
-                    }
+                    final String s = applicableCodec.decode(currentChar, type);
 
                     sb.append(s);
                 }
@@ -543,6 +607,12 @@ public class SpecificCharacterSet {
         private Codec getInitialCodecG1() {
             return codecs[0].hasEscSeq1() ? codecs[0] : null;
         }
+
+    }
+
+    protected SpecificCharacterSet(final Codec[] codecs, final String... codes) {
+        this.codecs = codecs;
+        this.dicomCodes = codes;
     }
 
     public static final void setDefaultCharacterSet(final String characterSet) {
@@ -570,17 +640,12 @@ public class SpecificCharacterSet {
         return dicomCodes;
     }
 
-    protected SpecificCharacterSet(final Codec[] codecs, final String... codes) {
-        this.codecs = codecs;
-        this.dicomCodes = codes;
-    }
-
     public byte[] encode(final String val, final StringValueType type) {
         return codecs[0].encode(val);
     }
 
     public String decode(final byte[] val, final StringValueType type) {
-        return codecs[0].decode(val);
+        return codecs[0].decode(val, type);
     }
 
     public boolean isUTF8() {

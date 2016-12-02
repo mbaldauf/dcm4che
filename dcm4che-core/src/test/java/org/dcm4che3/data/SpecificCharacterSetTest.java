@@ -118,7 +118,7 @@ public class SpecificCharacterSetTest {
             (byte) 0x24, (byte) 0x5e, (byte) 0x24, (byte) 0x40, (byte) 0x1b,
             (byte) 0x28, (byte) 0x42, (byte) 0x5e, (byte) 0x1b, (byte) 0x24,
             (byte) 0x42, (byte) 0x24, (byte) 0x3f, (byte) 0x24, (byte) 0x6d,
-            (byte) 0x24, (byte) 0x26 };
+            (byte) 0x24, (byte) 0x26, (byte) 0x1b, (byte) 0x28, (byte) 0x42 };
 
     private static final byte[] JAPANESE_PERSON_NAME_JISX0201_BYTES = {
             (byte) 0xd4, (byte) 0xcf, (byte) 0xc0, (byte) 0xde, (byte) 0x5e,
@@ -131,7 +131,8 @@ public class SpecificCharacterSetTest {
             (byte) 0x64, (byte) 0x24, (byte) 0x5e, (byte) 0x24, (byte) 0x40,
             (byte) 0x1b, (byte) 0x28, (byte) 0x4a, (byte) 0x5e, (byte) 0x1b,
             (byte) 0x24, (byte) 0x42, (byte) 0x24, (byte) 0x3f, (byte) 0x24,
-            (byte) 0x6d, (byte) 0x24, (byte) 0x26 };
+            (byte) 0x6d, (byte) 0x24, (byte) 0x26, (byte) 0x1b, (byte) 0x28,
+            (byte) 0x4a };
 
     private static final byte[] KOREAN_PERSON_NAME_BYTES = {
             (byte) 0x48, (byte) 0x6f, (byte) 0x6e, (byte) 0x67, (byte) 0x5e,
